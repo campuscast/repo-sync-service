@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { MetricsModule } from '@campuscast/shared-libs';
 import { ConfigModule } from '@nestjs/config';
 import { GatewayModule } from './gateway/gateway.module';
 import { IngestorModule } from './ingestor/ingestor.module';
@@ -18,6 +19,7 @@ import { appConfig, redisConfig, mqttConfig, validate } from './config';
     IngestorModule,
     DistributorModule,
     MqttPublisherModule,
+      MetricsModule,
   ],
   controllers: [HealthController],
 })

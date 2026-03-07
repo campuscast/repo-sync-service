@@ -10,6 +10,10 @@ const MAX_PAYLOAD_BYTES = parseInt(process.env.MAX_PAYLOAD_BYTES || '65536', 10)
 @Injectable()
 export class IngestorService {
   private readonly logger = new Logger(IngestorService.name);
+  private readonly signingKmsUrl = process.env.SIGNING_KMS_URL || 'http://localhost:3008';
+  private readonly zonePolicyUrl = process.env.ZONE_SERVICE_URL || 'http://localhost:3002';
+  private readonly scheduleServiceUrl = process.env.SCHEDULE_SERVICE_URL || 'http://localhost:3005';
+  private readonly deviceServiceUrl = process.env.DEVICE_SERVICE_URL || 'http://localhost:3003';
 
   constructor(
     private readonly schemaValidator: SchemaValidatorService,
@@ -33,38 +37,168 @@ export class IngestorService {
   async processOps(scheduleId: string, ops: any[], correlationId: string) {
     this.logger.log(`Processing ${ops.length} ops for schedule=${scheduleId} [${correlationId}]`);
 
+    const scheduleRes = await fetch(`${this.scheduleServiceUrl}/schedules/${scheduleId}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!scheduleRes.ok) {
+      return {
+        accepted: 0,
+        rejected: ops.length,
+        results: ops.map(op => ({
+          operation_id: op?.causal?.operation_id || 'unknown',
+          accepted: false,
+          reason: `schedule_not_found:${scheduleId}`,
+        })),
+      };
+    }
+    const schedule = await scheduleRes.json() as { zone_id: string };
+    const zoneId = schedule.zone_id;
+
     let accepted = 0;
     let rejected = 0;
-    const rejectedReasons: string[] = [];
+    const preRejected: Array<{ operation_id: string; accepted: false; reason: string }> = [];
+    const acceptedOps: any[] = [];
 
     for (const op of ops) {
+      const operationId = op?.causal?.operation_id || 'unknown';
+
       // 1. Schema validation
       if (!this.schemaValidator.validateOp(op)) {
         rejected++;
-        rejectedReasons.push(`invalid_schema:${op.causal?.operation_id || 'unknown'}`);
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'invalid_schema' });
         continue;
       }
 
-      // 2. Dedup check
+      // 2. Signature verification
+      const signature = op?.signature?.signature;
+      const keyId = op?.signature?.key_id;
+      if (!signature || !keyId) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'missing_signature' });
+        continue;
+      }
+      const signCheckRes = await fetch(`${this.signingKmsUrl}/signing/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data_base64: Buffer.from(JSON.stringify({
+            op_type: op.op_type,
+            causal: op.causal,
+            slot: op.slot,
+            params: op.params || {},
+          })).toString('base64'),
+          signature,
+          key_id: keyId,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!signCheckRes.ok) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'signature_verification_unavailable' });
+        continue;
+      }
+      const signCheck = await signCheckRes.json() as { valid: boolean };
+      if (!signCheck.valid) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'invalid_signature' });
+        continue;
+      }
+
+      // 3. Device trust check
+      const deviceId = op?.actor?.device_id || op?.causal?.device_id || op?.causal?.client_id;
+      if (!deviceId) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'device_identity_required' });
+        continue;
+      }
+      const deviceRes = await fetch(`${this.deviceServiceUrl}/devices/${encodeURIComponent(deviceId)}`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!deviceRes.ok) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: `unknown_device:${deviceId}` });
+        continue;
+      }
+      const device = await deviceRes.json() as { status?: string };
+      if (device.status !== 'active') {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: `device_not_trusted:${device.status || 'unknown'}` });
+        continue;
+      }
+
+      // 4. Dedup check
       const opId = op.causal?.operation_id;
       if (opId && await this.dedup.isDuplicate(opId)) {
         this.logger.debug(`Duplicate op: ${opId}`);
         rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'duplicate_operation' });
         continue;
       }
 
-      // 3. Rate limit
+      // 5. Rate limit
       const clientId = op.causal?.client_id || 'unknown';
       if (!await this.rateLimiter.check(clientId)) {
         rejected++;
-        rejectedReasons.push(`rate_limited:${clientId}`);
+        preRejected.push({ operation_id: operationId, accepted: false, reason: `rate_limited:${clientId}` });
         continue;
       }
 
-      // 4. Forward to schedule service (stub)
-      accepted++;
+      // 6. Policy check (zone-policy source of truth)
+      const policyRes = await fetch(`${this.zonePolicyUrl}/policy/check`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: deviceId,
+          zone_id: zoneId,
+          action: 'sync:ingest',
+          resource_id: scheduleId,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!policyRes.ok) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: 'policy_check_unavailable' });
+        continue;
+      }
+      const policy = await policyRes.json() as { allowed: boolean; reason?: string };
+      if (!policy.allowed) {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: policy.reason || 'policy_denied' });
+        continue;
+      }
+
+      acceptedOps.push(op);
     }
 
-    return { accepted, rejected, rejectedReasons };
+    let forwardedResults: Array<{ operation_id: string; accepted: boolean; reason?: string; explanation?: string; compensating_ops?: any[] }> = [];
+    if (acceptedOps.length > 0) {
+      const forwardRes = await fetch(`${this.scheduleServiceUrl}/schedules/${scheduleId}/ops`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ops: acceptedOps }),
+        signal: AbortSignal.timeout(7000),
+      });
+      if (!forwardRes.ok) {
+        const reason = `schedule_forward_failed:${forwardRes.status}`;
+        forwardedResults = acceptedOps.map(op => ({
+          operation_id: op?.causal?.operation_id || 'unknown',
+          accepted: false,
+          reason,
+        }));
+      } else {
+        const forwardPayload = await forwardRes.json() as { results?: Array<{ operation_id: string; accepted: boolean; reason?: string; explanation?: string; compensating_ops?: any[] }> };
+        forwardedResults = forwardPayload.results || acceptedOps.map(op => ({
+          operation_id: op?.causal?.operation_id || 'unknown',
+          accepted: true,
+        }));
+      }
+    }
+
+    for (const result of forwardedResults) {
+      if (result.accepted) accepted++;
+      else rejected++;
+    }
+
+    return { accepted, rejected, results: [...preRejected, ...forwardedResults] };
   }
 }

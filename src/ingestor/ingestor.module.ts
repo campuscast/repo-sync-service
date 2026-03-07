@@ -3,7 +3,9 @@ import { IngestorService } from './ingestor.service';
 import { SchemaValidatorService } from '../schema-validator/schema-validator.service';
 import { DedupService } from '../dedup/dedup.service';
 import { RateLimiterService } from '../rate-limiter/rate-limiter.service';
+import { IngestorController } from './ingestor.controller';
 @Module({
+  controllers: [IngestorController],
   providers: [IngestorService, SchemaValidatorService, DedupService, RateLimiterService],
   exports: [IngestorService],
 })

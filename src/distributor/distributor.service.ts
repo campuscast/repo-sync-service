@@ -6,6 +6,6 @@ export class DistributorService {
 
   async distributeToEditors(scheduleId: string, ops: any[]): Promise<number> {
     this.logger.log(`Distributing ${ops.length} ops for schedule=${scheduleId} to WS clients`);
-    return 0; // stub: return number of WS clients notified
+    return 0;
   }
 }
