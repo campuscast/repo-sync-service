@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { SchemaValidatorService } from '../schema-validator/schema-validator.service';
 import { DedupService } from '../dedup/dedup.service';
 import { RateLimiterService } from '../rate-limiter/rate-limiter.service';
+import { buildCanonicalScheduleOpPayload } from './op-signature';
 
 /** Limits per single WS message */
 const MAX_OPS_PER_BATCH = parseInt(process.env.MAX_OPS_PER_BATCH || '50', 10);
@@ -72,21 +73,24 @@ export class IngestorService {
       // 2. Signature verification
       const signature = op?.signature?.signature;
       const keyId = op?.signature?.key_id;
-      if (!signature || !keyId) {
+      const algorithm = op?.signature?.algorithm;
+      if (!signature || !keyId || !algorithm) {
         rejected++;
         preRejected.push({ operation_id: operationId, accepted: false, reason: 'missing_signature' });
         continue;
       }
+      if (algorithm !== 'Ed25519') {
+        rejected++;
+        preRejected.push({ operation_id: operationId, accepted: false, reason: `unsupported_signature_algorithm:${algorithm}` });
+        continue;
+      }
+
+      const canonicalPayload = buildCanonicalScheduleOpPayload(op);
       const signCheckRes = await fetch(`${this.signingKmsUrl}/signing/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          data_base64: Buffer.from(JSON.stringify({
-            op_type: op.op_type,
-            causal: op.causal,
-            slot: op.slot,
-            params: op.params || {},
-          })).toString('base64'),
+          data_base64: Buffer.from(canonicalPayload, 'utf8').toString('base64'),
           signature,
           key_id: keyId,
         }),
@@ -104,26 +108,32 @@ export class IngestorService {
         continue;
       }
 
-      // 3. Device trust check
+      // 3. Identity / trust checks
+      const editorUserId = op?.actor?.user_id || op?.causal?.user_id;
+      const actorType = op?.actor?.auth_type;
       const deviceId = op?.actor?.device_id || op?.causal?.device_id || op?.causal?.client_id;
-      if (!deviceId) {
-        rejected++;
-        preRejected.push({ operation_id: operationId, accepted: false, reason: 'device_identity_required' });
-        continue;
-      }
-      const deviceRes = await fetch(`${this.deviceServiceUrl}/devices/${encodeURIComponent(deviceId)}`, {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!deviceRes.ok) {
-        rejected++;
-        preRejected.push({ operation_id: operationId, accepted: false, reason: `unknown_device:${deviceId}` });
-        continue;
-      }
-      const device = await deviceRes.json() as { status?: string };
-      if (device.status !== 'active') {
-        rejected++;
-        preRejected.push({ operation_id: operationId, accepted: false, reason: `device_not_trusted:${device.status || 'unknown'}` });
-        continue;
+      const isEditorFlow = Boolean(editorUserId) && actorType === 'user_session';
+
+      if (!isEditorFlow) {
+        if (!deviceId) {
+          rejected++;
+          preRejected.push({ operation_id: operationId, accepted: false, reason: 'device_identity_required' });
+          continue;
+        }
+        const deviceRes = await fetch(`${this.deviceServiceUrl}/devices/${encodeURIComponent(deviceId)}`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!deviceRes.ok) {
+          rejected++;
+          preRejected.push({ operation_id: operationId, accepted: false, reason: `unknown_device:${deviceId}` });
+          continue;
+        }
+        const device = await deviceRes.json() as { status?: string };
+        if (device.status !== 'active') {
+          rejected++;
+          preRejected.push({ operation_id: operationId, accepted: false, reason: `device_not_trusted:${device.status || 'unknown'}` });
+          continue;
+        }
       }
 
       // 4. Dedup check
@@ -144,15 +154,24 @@ export class IngestorService {
       }
 
       // 6. Policy check (zone-policy source of truth)
+      const policyPayload = isEditorFlow
+        ? {
+            user_id: editorUserId,
+            zone_id: zoneId,
+            action: 'schedule:write',
+            resource_id: scheduleId,
+          }
+        : {
+            device_id: deviceId,
+            zone_id: zoneId,
+            action: 'sync:ingest',
+            resource_id: scheduleId,
+          };
+
       const policyRes = await fetch(`${this.zonePolicyUrl}/policy/check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          device_id: deviceId,
-          zone_id: zoneId,
-          action: 'sync:ingest',
-          resource_id: scheduleId,
-        }),
+        body: JSON.stringify(policyPayload),
         signal: AbortSignal.timeout(5000),
       });
       if (!policyRes.ok) {

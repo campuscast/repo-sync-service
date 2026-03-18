@@ -168,6 +168,35 @@ describe('Sync Gateway — sync_request & broadcast scenarios (unit-level)', () 
     expect((clientMessage as any).missing_ops).toBeUndefined();
   });
 
+  it('sync_request with known last_known_operation_id should pass missing_ops delta through', () => {
+    const scheduleServiceResponse = {
+      schedule_id: 'sched-1',
+      epoch: 3,
+      slots: [{ slot_id: 's1', asset_id: 'a1' }],
+      snapshot_hash: 'abc123',
+      last_operation_id: 'op-12',
+      missing_ops: [
+        { op_type: 'update_slot', operation_id: 'op-11', slot_data: { slot_id: 's1', priority: 55 }, lamport_ts: 1100, client_id: 'editor:a' },
+        { op_type: 'move_slot', operation_id: 'op-12', slot_data: { slot_id: 's1', start_time: '2026-01-01T01:00:00Z', end_time: '2026-01-01T02:00:00Z' }, lamport_ts: 1200, client_id: 'editor:b' },
+      ],
+    };
+
+    const clientMessage = {
+      type: 'snapshot',
+      correlation_id: 'web-124',
+      schedule_id: scheduleServiceResponse.schedule_id,
+      slots: scheduleServiceResponse.slots,
+      epoch: scheduleServiceResponse.epoch,
+      snapshot_hash: scheduleServiceResponse.snapshot_hash,
+      last_operation_id: scheduleServiceResponse.last_operation_id,
+      missing_ops: scheduleServiceResponse.missing_ops,
+    };
+
+    expect(clientMessage.last_operation_id).toBe('op-12');
+    expect(clientMessage.missing_ops).toHaveLength(2);
+    expect(clientMessage.missing_ops[0].operation_id).toBe('op-11');
+  });
+
   it('duplicate operation_id is handled gracefully via already_applied', () => {
     // Simulate what schedule-service returns when ingestor sends a dup op
     const ingestResult = {
